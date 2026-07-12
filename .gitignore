@@ -6,3 +6,12 @@ dist/
 build/
 .pytest_cache/
 *.egg
+
+# scorecard: never commit raw DE-SynPUF or generated reports
+DE1_0_*.csv
+DE1_0_*.zip
+/scorecard.json
+/scorecard.md
+
+# internal experiments — never ship
+experiments/

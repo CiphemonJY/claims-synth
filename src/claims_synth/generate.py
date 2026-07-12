@@ -120,6 +120,61 @@ REVENUE_CODES: dict[str, str] = {
 
 # ── Generator ──────────────────────────────────────────────────────────────
 
+# Evidence-based "realistic inpatient" preset, calibrated directly against the bundled
+# DE-SynPUF aggregate reference (the same public aggregates the fidelity scorecard grades
+# against). Each marginal the scorecard measures — total charge, length of stay, diagnosis
+# count, line count, primary-diagnosis chapter mix — is sampled from the reference
+# distribution itself, subject to structural validity (>=1 line, >=1 diagnosis,
+# non-negative charges). Opt-in via ClaimGenerator.realistic_inpatient(); the default
+# generator is unchanged.
+
+_REFSTATS_PATH = Path(__file__).parent / "scorecard" / "data" / "desynpuf_refstats.json"
+
+
+def _renormalize(dist: dict, drop: tuple = ()) -> dict:
+    kept = {k: v for k, v in dist.items() if k not in drop and v > 0}
+    total = sum(kept.values())
+    return {k: v / total for k, v in kept.items()}
+
+
+def _dist_arrays(dist: dict):
+    keys = sorted(int(k) for k in dist)
+    p = np.array([dist[str(k)] for k in keys], dtype=np.float64)
+    return np.array(keys), p / p.sum()
+
+
+def _cat_arrays(dist: dict):
+    keys = sorted(dist)
+    p = np.array([dist[k] for k in keys], dtype=np.float64)
+    return keys, p / p.sum()
+
+
+def load_inpatient_calibration(refstats_path: Optional[Path] = None) -> dict:
+    """Build realistic-inpatient calibration from the bundled DE-SynPUF aggregate reference.
+
+    Structural validity constraints applied:
+    - n_dx: claims need >=1 diagnosis, so the reference's tiny mass at 0 is dropped.
+    - n_line: claims need >=1 line (lines carry the charges; real 837I requires a service
+      line too), so the reference's zero-procedure mass is renormalized over counts >=1 —
+      the JS-optimal reallocation under that constraint.
+    - amount: negative reference payments are clamped to 0 (charges must be non-negative).
+    - dx_chapter: restricted to chapters with codes in the shipped vocab, renormalized.
+    """
+    from claims_synth.scorecard.taxonomy import icd10_chapter
+    path = refstats_path or _REFSTATS_PATH
+    ref = json.loads(Path(path).read_text())
+    vocab_chapters = {icd10_chapter(c.code) for c in ICD10_CODES}
+    chapter_dist = _renormalize(
+        {k: v for k, v in ref["dx_chapter"]["dist"].items() if k in vocab_chapters})
+    return {
+        "amount_grid": [max(0.0, float(x)) for x in ref["amount"]["sorted"]],
+        "los_dist": _renormalize(ref["los"]["dist"]),
+        "n_dx_dist": _renormalize(ref["n_dx"]["dist"], drop=("0",)),
+        "n_line_dist": _renormalize(ref["n_proc"]["dist"], drop=("0",)),
+        "dx_chapter_dist": chapter_dist,
+    }
+
+
 class ClaimGenerator:
     """
     Deterministic synthetic claim generator.
@@ -130,7 +185,9 @@ class ClaimGenerator:
     """
 
     def __init__(self, seed: int = 42, cpt_codes: Optional[list[str]] = None,
-                 cpt_weight: float = 0.0):
+                 cpt_weight: float = 0.0, n_dx_mu=None, n_dx_sigma: float = 1.5,
+                 n_line_mu=None, n_line_sigma: float = 1.5,
+                 calibration: Optional[dict] = None):
         """
         Args:
             seed: Random seed for reproducibility.
@@ -140,6 +197,21 @@ class ClaimGenerator:
         self.rng = np.random.RandomState(seed)
         self._claim_counter = 0
         self._cpt_weight = cpt_weight
+        self._n_dx_mu = n_dx_mu
+        self._n_dx_sigma = n_dx_sigma
+        self._n_line_mu = n_line_mu
+        self._n_line_sigma = n_line_sigma
+        self._cal = calibration
+        if calibration:
+            from claims_synth.scorecard.taxonomy import icd10_chapter
+            self._cal_amount = np.asarray(calibration["amount_grid"], dtype=np.float64)
+            self._cal_los_k, self._cal_los_p = _dist_arrays(calibration["los_dist"])
+            self._cal_ndx_k, self._cal_ndx_p = _dist_arrays(calibration["n_dx_dist"])
+            self._cal_nline_k, self._cal_nline_p = _dist_arrays(calibration["n_line_dist"])
+            self._cal_ch_k, self._cal_ch_p = _cat_arrays(calibration["dx_chapter_dist"])
+            self._chapter_codes: dict[str, list[int]] = {}
+            for i, c in enumerate(ICD10_CODES):
+                self._chapter_codes.setdefault(icd10_chapter(c.code), []).append(i)
 
         if cpt_codes:
             register_cpt_codes(cpt_codes, category="user-supplied")
@@ -171,6 +243,17 @@ class ClaimGenerator:
         self._proc_weights = np.array(self._proc_weights, dtype=np.float64)
         self._proc_weights /= self._proc_weights.sum()
 
+    @classmethod
+    def realistic_inpatient(cls, seed: int = 42, **kwargs) -> "ClaimGenerator":
+        """Generator calibrated to CMS DE-SynPUF inpatient marginals (837I only).
+
+        Charge totals, LOS, diagnosis/line counts, and the primary-diagnosis chapter mix are
+        sampled from the bundled DE-SynPUF aggregate reference (see load_inpatient_calibration).
+        Extra kwargs override constructor args.
+        """
+        kwargs.setdefault("calibration", load_inpatient_calibration())
+        return cls(seed=seed, **kwargs)
+
     def generate(self, n: int = 1) -> list[Claim]:
         """Generate n claims."""
         claims = []
@@ -182,12 +265,22 @@ class ClaimGenerator:
         return claims
 
     def _sample_claim_type(self) -> ClaimType:
+        if self._cal:
+            return ClaimType.INSTITUTIONAL  # calibration reference is inpatient-only
         return ClaimType.PROFESSIONAL if self.rng.random() < 0.7 else ClaimType.INSTITUTIONAL
 
     def _build_claim(self, claim_type: ClaimType) -> Claim:
         # ── Diagnoses ──────────────────────────────────────────────────
-        n_dx = self.rng.randint(1, 6)
-        dx_indices = self.rng.choice(len(ICD10_CODES), size=n_dx, p=DX_WEIGHTS, replace=False)
+        if self._cal:
+            n_dx = int(self._cal_ndx_k[self.rng.choice(len(self._cal_ndx_k), p=self._cal_ndx_p)])
+            dx_indices = self._sample_dx_calibrated(n_dx)
+        elif self._n_dx_mu is None:
+            n_dx = self.rng.randint(1, 6)
+            dx_indices = self.rng.choice(len(ICD10_CODES), size=n_dx, p=DX_WEIGHTS, replace=False)
+        else:
+            n_dx = max(1, min(min(10, len(ICD10_CODES)),
+                              int(round(self.rng.normal(self._n_dx_mu, self._n_dx_sigma)))))
+            dx_indices = self.rng.choice(len(ICD10_CODES), size=n_dx, p=DX_WEIGHTS, replace=False)
         diagnoses = []
         for idx in dx_indices:
             dx_code = ICD10_CODES[idx]
@@ -200,11 +293,18 @@ class ClaimGenerator:
         encounter = self._build_encounter(claim_type)
 
         # ── Lines ───────────────────────────────────────────────────────
-        n_lines = self.rng.randint(1, 6)
+        if self._cal:
+            n_lines = int(self._cal_nline_k[self.rng.choice(len(self._cal_nline_k), p=self._cal_nline_p)])
+        elif self._n_line_mu is None:
+            n_lines = self.rng.randint(1, 6)
+        else:
+            n_lines = max(1, min(10, int(round(self.rng.normal(self._n_line_mu, self._n_line_sigma)))))
         lines = []
         for seq in range(1, n_lines + 1):
             line = self._build_line(seq, diagnoses, claim_type)
             lines.append(line)
+        if self._cal:
+            self._apply_calibrated_charges(lines)
 
         # ── Payer ───────────────────────────────────────────────────────
         payer_idx = self.rng.choice(len(PAYER_POOL), p=PAYER_WEIGHTS)
@@ -241,6 +341,31 @@ class ClaimGenerator:
 
         return claim
 
+    def _sample_dx_calibrated(self, n_dx: int) -> list[int]:
+        """Primary diagnosis follows the reference chapter mix; secondaries follow DX_WEIGHTS."""
+        ch = self._cal_ch_k[self.rng.choice(len(self._cal_ch_k), p=self._cal_ch_p)]
+        pool = self._chapter_codes[ch]
+        w = DX_WEIGHTS[pool] / DX_WEIGHTS[pool].sum()
+        primary = int(self.rng.choice(pool, p=w))
+        indices = [primary]
+        if n_dx > 1:
+            rest_w = DX_WEIGHTS.copy()
+            rest_w[primary] = 0.0
+            rest_w /= rest_w.sum()
+            rest = self.rng.choice(len(ICD10_CODES), size=n_dx - 1, p=rest_w, replace=False)
+            indices.extend(int(i) for i in rest)
+        return indices
+
+    def _apply_calibrated_charges(self, lines: list[ClaimLine]) -> None:
+        """Distribute a reference-sampled total charge across lines, exact to the cent."""
+        total = float(self._cal_amount[self.rng.randint(0, len(self._cal_amount))])
+        cents = int(round(total * 100))
+        cuts = sorted(int(c) for c in self.rng.randint(0, cents + 1, size=len(lines) - 1)) if len(lines) > 1 else []
+        bounds = [0] + cuts + [cents]
+        for line, lo, hi in zip(lines, bounds[:-1], bounds[1:]):
+            line.units = 1
+            line.charge = (hi - lo) / 100.0
+
     def _build_encounter(self, claim_type: ClaimType) -> Optional[Encounter]:
         if claim_type == ClaimType.PROFESSIONAL and self.rng.random() < 0.3:
             return None
@@ -249,7 +374,10 @@ class ClaimGenerator:
         from_date = date.today() - timedelta(days=days_ago)
 
         if claim_type == ClaimType.INSTITUTIONAL:
-            los = self.rng.randint(1, 14)
+            if self._cal:
+                los = int(self._cal_los_k[self.rng.choice(len(self._cal_los_k), p=self._cal_los_p)])
+            else:
+                los = self.rng.randint(1, 14)
             to_date = from_date + timedelta(days=los)
         else:
             to_date = None

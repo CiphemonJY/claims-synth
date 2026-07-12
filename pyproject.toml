@@ -24,9 +24,13 @@ dev = [
 
 [project.scripts]
 claims-synth = "claims_synth.generate:main"
+claims-synth-scorecard = "claims_synth.scorecard.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.setuptools.package-data]
+"claims_synth.scorecard" = ["data/*.json"]
