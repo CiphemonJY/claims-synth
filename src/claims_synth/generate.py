@@ -187,16 +187,23 @@ class ClaimGenerator:
     def __init__(self, seed: int = 42, cpt_codes: Optional[list[str]] = None,
                  cpt_weight: float = 0.0, n_dx_mu=None, n_dx_sigma: float = 1.5,
                  n_line_mu=None, n_line_sigma: float = 1.5,
+                 late_filing_rate: float = 0.0,
                  calibration: Optional[dict] = None):
         """
         Args:
             seed: Random seed for reproducibility.
             cpt_codes: User-supplied CPT code list (opaque IDs).
             cpt_weight: Probability of selecting a CPT code vs HCPCS (0.0 = HCPCS only).
+            late_filing_rate: Probability that a claim is filed after the payer's
+                timely-filing window. Default 0.0 preserves the existing claim-age
+                distribution the fidelity scorecard is calibrated against. Set it
+                above 0 to produce timely-filing (CARC 29) denials -- see the note
+                in _build_claim for why they are otherwise unreachable.
         """
         self.rng = np.random.RandomState(seed)
         self._claim_counter = 0
         self._cpt_weight = cpt_weight
+        self._late_filing_rate = late_filing_rate
         self._n_dx_mu = n_dx_mu
         self._n_dx_sigma = n_dx_sigma
         self._n_line_mu = n_line_mu
@@ -321,6 +328,33 @@ class ClaimGenerator:
         else:
             stmt_from = date.today() - timedelta(days=self.rng.randint(0, 30))
             stmt_to = stmt_from
+
+        # Late-filed claims.
+        #
+        # Without this, timely-filing denials are STRUCTURALLY IMPOSSIBLE. Every
+        # payer profile configures timely_filing_days (90-365) and a
+        # timely_filing_denial_rate of 0.95, but service dates above are at most
+        # 90 days old and an institutional stay only pushes statement_to later --
+        # so `days_since > timely_filing_days` in Adjudicator.adjudicate() was
+        # false on 30,000/30,000 claims and the denial roll behind it never
+        # executed even once.
+        #
+        # Shift the SERVICE dates too, not just the statement dates: a late-filed
+        # claim is an old encounter billed now, not a recent encounter with a
+        # backdated statement.
+        #
+        # Defaults to 0.0 (off) because enabling it moves the claim-age
+        # distribution that the DE-SynPUF fidelity scorecard is calibrated
+        # against. The draw is guarded so that at the default no RNG value is
+        # consumed and output stays byte-identical to before this change.
+        if self._late_filing_rate > 0.0 and self.rng.random() < self._late_filing_rate:
+            backdate = timedelta(days=int(self.rng.randint(95, 500)))
+            stmt_from -= backdate
+            stmt_to -= backdate
+            if encounter:
+                encounter.from_date -= backdate
+                if encounter.to_date:
+                    encounter.to_date -= backdate
 
         claim = Claim(
             claim_id=f"C{self._claim_counter:08d}",
@@ -476,6 +510,9 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON (one per line)")
     parser.add_argument("--cpt-codes", type=str, default=None,
                         help="Comma-separated user-supplied CPT codes (opaque IDs)")
+    parser.add_argument("--late-filing-rate", type=float, default=0.0,
+                        help="Fraction of claims filed past the payer's timely-filing "
+                             "window (produces CARC 29 denials; 0 = off, the default)")
     parser.add_argument("--cpt-weight", type=float, default=0.0,
                         help="Probability of selecting CPT vs HCPCS (0.0-1.0)")
     args = parser.parse_args(argv)
@@ -484,7 +521,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     if args.cpt_codes:
         cpt_codes = [c.strip() for c in args.cpt_codes.split(",") if c.strip()]
 
-    gen = ClaimGenerator(seed=args.seed, cpt_codes=cpt_codes, cpt_weight=args.cpt_weight)
+    gen = ClaimGenerator(seed=args.seed, cpt_codes=cpt_codes, cpt_weight=args.cpt_weight,
+                         late_filing_rate=args.late_filing_rate)
     claims = gen.generate(n=args.n)
 
     if args.type == "837I":
