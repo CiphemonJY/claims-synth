@@ -17,9 +17,18 @@ authors = [
 ]
 
 [project.optional-dependencies]
+# Backs the default predictor behind the scorecard's ML-utility (TRTR/TSTR)
+# column. Without it that one column is skipped with a message; every other
+# part of the package runs on numpy alone.
+scorecard = [
+    "lightgbm>=4.0",
+    "pandas>=1.5",
+]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
+    "lightgbm>=4.0",
+    "pandas>=1.5",
 ]
 
 [project.scripts]

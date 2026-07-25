@@ -119,6 +119,78 @@ Two design notes:
   ceiling above. Joint structure (e.g., charge × LOS correlation) is not yet calibrated or
   scored; that is the natural next dimension.
 
+### ML utility — TRTR/TSTR, with calibration and a measured resolution
+
+Fidelity asks whether the marginals match. Utility asks the question a user of synthetic
+data actually has: **if I train my model on this, does it work?** The scorecard's second
+column runs the standard protocol against the package's own denial label (the G2
+adjudicator's verdict: 1 when the payer denied at least one line of the claim):
+
+- **TRTR** — train on real rows, evaluate on held-out real rows. The ceiling.
+- **TSTR** — train on synthetic rows, evaluate on the *same* held-out real rows.
+- **utility ratio** — `max(0, (TSTR_AUC − 0.5) / (TRTR_AUC − 0.5))`, chance-corrected so a
+  coin-flip synthetic arm scores 0 instead of the ~0.55 a raw AUC ratio would flatter it
+  with. Both arms are downsampled to the same training size, so a generator cannot score
+  better merely by emitting more rows.
+
+Three things this column reports that a rank-only utility score does not:
+
+**Calibration, not just ranking.** AUC is invariant to every monotone rescaling of the
+score, so a model whose probabilities are perfectly *ordered* but wildly mis-scaled earns a
+perfect utility ratio. The denial-risk model on the roadmap (G5) consumes a **probability**
+— thresholded to route claims for review — not a ranking, so the column reports **Brier**
+and **ECE** (equal-frequency bins) alongside AUC for both arms, plus an isotonic-calibrated
+variant fitted out-of-fold on each arm's own training rows. The two are close to
+orthogonal in practice: on the run below, isotonic moved AUC by 0.002 while cutting ECE by
+35%. Only one of those is visible to AUC.
+
+**A variance band on every number.** One split and one fit produce a point estimate with no
+scale — 0.82 vs 0.74 is uninterpretable on its own. Every metric is reported as
+mean ± sd with min/max over `--ml-repeats` independent re-draws of both populations and
+the train/test split.
+
+**A resolution that was measured, not asserted.** Running the column on a *true-zero*
+comparison — where the candidate generator IS the held-out population, so the honest answer
+is "no difference" — 30 times at one repeat and 20 times at five gives its actual noise
+floor:
+
+| repeats | null sd of the utility ratio | smallest resolvable difference (80% power) |
+|---|---|---|
+| 1 | 0.304 | 0.85 |
+| 5 (default) | 0.135 | 0.38 |
+
+So **at the defaults this column resolves utility-ratio differences of about 0.38 or
+larger, and nothing finer.** It separates "the synthetic data carries the predictive
+signal" from "it does not"; it cannot rank two decent generators against each other.
+Resolution improves as 1/√repeats — buy it with `--ml-repeats`, not by reading more into
+a small gap. Two further honest notes from the same measurement: the ratio is *upward
+biased* at modest AUC (it centred on 1.03 where the truth was 1.00, because it divides by a
+small and noisy AUC−0.5), so treat 1.0 as "parity, within noise" rather than a target to
+beat; and the underlying AUCs (~0.65) are modest because the adjudicator's denials are
+partly stochastic by design.
+
+```
+python -m claims_synth.scorecard --realistic --claim-type institutional --n 3000
+python -m claims_synth.scorecard --ml-repeats 15         # tighter band, slower
+python -m claims_synth.scorecard --no-ml-utility         # fidelity only
+python -m claims_synth.scorecard --ml-real-csv my_claims.csv   # a true TSTR
+```
+
+The default predictor is LightGBM, which fits in milliseconds:
+`pip install 'claims-synth[scorecard]'`. Without it the column is skipped with a message
+and the rest of the scorecard is unaffected. The scorer is predictor-agnostic — pass any
+`predictor_factory` with sklearn-style `fit`/`predict_proba`; a
+[TabFM](https://github.com/google-research/tabfm) adapter is included as an optional
+zero-shot second opinion (it needs Python ≥ 3.11 and ~20 GB of RAM, so it is not the
+default).
+
+**Read this before quoting the ratio.** Unless you pass `--ml-real-csv`, there is no real
+data in the loop. The held-out "real" population is the reference-calibrated
+`realistic_inpatient` preset, which makes the number a *transfer check between two
+synthetic populations* — useful for catching a generator that destroys the joint structure
+the payer rules key off, and not evidence about live claims. Point `--ml-real-csv` at your
+own labelled claims (same feature columns plus a `denied` 0/1 column) to get a true TSTR.
+
 ### Building the reference
 
 The repo bundles a small (~20 KB) reference at
