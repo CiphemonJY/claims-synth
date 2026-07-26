@@ -4,7 +4,7 @@ Synthetic healthcare claim generator + rules-based payer adjudicator for denial-
 
 **Zero copyrighted code descriptions.** ICD-10 + HCPCS Level II only as shipped vocab. CPT treated as opaque user-supplied IDs.
 
-## G1 — Claim Generator ✅
+## G1 — Claim Generator
 
 ```
 python -m claims_synth.generate --n 500 --seed 7
@@ -19,7 +19,7 @@ Produces deterministic, reproducible synthetic claims (837I + 837P) with:
 - Authorization fields (auth number, status, referral)
 - Full validation (structural, charge consistency, pointer integrity)
 
-## G2 — Rules-Based Payer Adjudicator ✅
+## G2 — Rules-Based Payer Adjudicator
 
 ```python
 from claims_synth.generate import ClaimGenerator
@@ -57,19 +57,19 @@ Rules-based adjudication producing 835-like remittance advice:
 
 | Goal | Description | Status |
 |------|-------------|--------|
-| G1 | Claim object + generator | ✅ |
-| G2 | Rules-based payer adjudicator → labeled 835s | ✅ |
-| G3 | Heterogeneous stochastic payer profiles | ⬜ |
-| G4 | Feature degradation (anti-leakage harness) | ⬜ |
-| G5 | Denial-risk model, gated on held-out payer | ⬜ |
-| G6 | Friction coefficients + negotiation parity report | ⬜ |
-| SC | Fidelity scorecard vs CMS DE-SynPUF | ✅ |
+| G1 | Claim object + generator | done |
+| G2 | Rules-based payer adjudicator → labeled 835s | done |
+| G3 | Heterogeneous stochastic payer profiles | planned |
+| G4 | Feature degradation (anti-leakage harness) | planned |
+| G5 | Denial-risk model, gated on held-out payer | planned |
+| G6 | Friction coefficients + negotiation parity report | planned |
+| SC | Fidelity scorecard vs CMS DE-SynPUF | done |
 
 ## License
 
 MIT. No AMA-copyrighted CPT content shipped.
 
-## Fidelity Scorecard — graded against CMS DE-SynPUF ✅
+## Fidelity Scorecard — graded against CMS DE-SynPUF
 
 How realistic is the synthetic output? claims-synth's claim shapes are modeled after
 CMS-style claims data, and the scorecard makes that measurable: it grades generated claims
