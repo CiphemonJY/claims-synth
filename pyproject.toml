@@ -13,7 +13,7 @@ dependencies = [
     "numpy>=1.24",
 ]
 authors = [
-    {name = "CiphemonJY"},
+    {name = "James Yeung"},
 ]
 
 [project.optional-dependencies]
